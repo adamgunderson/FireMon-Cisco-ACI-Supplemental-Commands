@@ -1,6 +1,6 @@
 # ACI to FireMon Configuration Transfer Script
 
-A Python script that retrieves configuration data from a Cisco ACI device and uploads it to a FireMon revision. This script is designed to run on a FireMon virtual appliance.
+A Python script that retrieves additional configuration data from a Cisco ACI device and uploads it to a FireMon revision. This script is designed to run on a FireMon virtual appliance.
 
 ## Purpose
 
