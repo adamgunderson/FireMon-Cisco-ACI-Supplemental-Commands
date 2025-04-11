@@ -122,6 +122,10 @@ from urllib3.exceptions import InsecureRequestWarning
 # Suppress only the single warning from urllib3 needed.
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
+# Add warning about SSL verification
+print("WARNING: SSL certificate verification is disabled for both ACI and FireMon API calls.")
+print("         This is insecure and should only be used in testing environments.")
+
 # HARD-CODED CREDENTIALS (USE WITH CAUTION - UNCOMMENT AND MODIFY IF NEEDED)
 # ---------------------------------
 # HARD_CODED_ACI_HOST = "192.168.101.4"
@@ -213,7 +217,7 @@ def get_aci_data(aci_host, cookies):
 
 def authenticate_firemon(firemon_host, username, password):
     """
-    Authenticate with FireMon API and return token.
+    Authenticate with FireMon API and return an authenticated session.
     
     Args:
         firemon_host (str): Hostname or IP address of the FireMon server
@@ -221,30 +225,52 @@ def authenticate_firemon(firemon_host, username, password):
         password (str): FireMon password
         
     Returns:
-        str: Authentication token
+        requests.Session: Authenticated session object
         
     Raises:
         requests.exceptions.RequestException: If authentication fails
+        ValueError: If authentication status is not AUTHORIZED
     """
-    auth_url = f"https://{firemon_host}/securitymanager/api/authentication/login"
+    # Initialize session
+    session = requests.Session()
+    session.verify = False  # Disable SSL verification
+    session.auth = (username, password)  # Set basic auth
+    session.headers.update({
+        'Content-Type': 'application/json',
+        'accept': 'application/json'
+    })
+    
+    # Prepare authentication payload
     auth_payload = {
         "username": username,
         "password": password
     }
     
-    headers = {
-        "Content-Type": "application/json",
-        "accept": "application/json"
-    }
-    
     try:
-        response = requests.post(auth_url, json=auth_payload, headers=headers, verify=True, timeout=30)
+        # Use the validate endpoint as shown in the example script
+        auth_url = f"https://{firemon_host}/securitymanager/api/authentication/validate"
+        response = session.post(auth_url, data=json.dumps(auth_payload), timeout=30)
         response.raise_for_status()
         
         auth_data = response.json()
-        if "token" not in auth_data:
-            raise ValueError("No token in response from FireMon")
-        return auth_data["token"]
+        auth_status = auth_data.get('authStatus', '')
+        
+        if auth_status != 'AUTHORIZED':
+            raise ValueError(f"Authentication failed with status: {auth_status}")
+        
+        # Now try to authenticate with the login endpoint to get a token
+        login_url = f"https://{firemon_host}/securitymanager/api/authentication/login"
+        login_response = session.post(login_url, data=json.dumps(auth_payload), timeout=30)
+        login_response.raise_for_status()
+        
+        login_data = login_response.json()
+        if 'token' in login_data:
+            # Add token to session headers
+            session.headers.update({'SESSIONID': login_data['token']})
+            print(f"Successfully obtained authentication token")
+        
+        print(f"Authentication successful with status: {auth_status}")
+        return session
     except (requests.exceptions.RequestException, ValueError) as e:
         print(f"ERROR: Failed to authenticate with FireMon: {str(e)}")
         if hasattr(e, 'response') and e.response is not None:
@@ -254,13 +280,13 @@ def authenticate_firemon(firemon_host, username, password):
         raise
 
 
-def get_latest_revision(firemon_host, token, domain_id, device_id):
+def get_latest_revision(firemon_host, session, domain_id, device_id):
     """
     Get the latest revision ID for a device.
     
     Args:
         firemon_host (str): Hostname or IP address of the FireMon server
-        token (str): Authentication token
+        session (requests.Session): Authenticated session
         domain_id (int): FireMon domain ID
         device_id (int): FireMon device ID
         
@@ -273,13 +299,8 @@ def get_latest_revision(firemon_host, token, domain_id, device_id):
     """
     url = f"https://{firemon_host}/securitymanager/api/domain/{domain_id}/device/{device_id}/rev/latest"
     
-    headers = {
-        "accept": "application/json",
-        "SESSIONID": token
-    }
-    
     try:
-        response = requests.get(url, headers=headers, verify=True, timeout=30)
+        response = session.get(url, timeout=30)
         response.raise_for_status()
         
         revision_data = response.json()
@@ -293,13 +314,13 @@ def get_latest_revision(firemon_host, token, domain_id, device_id):
         raise
 
 
-def post_files_to_firemon(firemon_host, token, revision_id, aci_data):
+def post_files_to_firemon(firemon_host, session, revision_id, aci_data):
     """
     Post configuration files to FireMon API.
     
     Args:
         firemon_host (str): Hostname or IP address of the FireMon server
-        token (str): Authentication token
+        session (requests.Session): Authenticated session
         revision_id (int): Revision ID
         aci_data (dict): Configuration data
         
@@ -311,14 +332,11 @@ def post_files_to_firemon(firemon_host, token, revision_id, aci_data):
     """
     url = f"https://{firemon_host}/securitymanager/api/rev/{revision_id}/nd/file?filetype=CONFIG"
     
-    headers = {
-        "accept": "application/json",
-        "SESSIONID": token
-    }
+    # Temporarily remove Content-Type header for multipart upload
+    content_type = session.headers.pop('Content-Type', None)
     
     # Create temporary files
     temp_files = []
-    file_handles = []
     
     try:
         # Create the temporary files
@@ -331,13 +349,17 @@ def post_files_to_firemon(firemon_host, token, revision_id, aci_data):
         # Create multipart form data
         files = []
         for name, file_path in temp_files:
-            f = open(file_path, 'rb')
-            file_handles.append(f)
-            files.append(('filename', (name, f, 'application/json')))
+            # Add file in the correct format: 'filename=@file_path'
+            files.append(('filename', (name, open(file_path, 'rb'))))
         
-        response = requests.post(url, headers=headers, files=files, verify=True, timeout=60)
+        # Make the request (let requests handle the multipart content type)
+        response = session.post(url, files=files, timeout=60)
         response.raise_for_status()
         
+        # Restore the Content-Type header
+        if content_type:
+            session.headers['Content-Type'] = content_type
+            
         return response.json()
     except requests.exceptions.RequestException as e:
         print(f"ERROR: Failed to post files to FireMon: {str(e)}")
@@ -345,16 +367,14 @@ def post_files_to_firemon(firemon_host, token, revision_id, aci_data):
             print(f"Response: {e.response.text}")
         raise
     finally:
-        # Close all file handles
-        for f in file_handles:
+        # Restore the Content-Type header if not already done
+        if content_type and 'Content-Type' not in session.headers:
+            session.headers['Content-Type'] = content_type
+            
+        # Close and delete temporary files
+        for name, file_path in temp_files:
             try:
-                f.close()
-            except:
-                pass
-                
-        # Delete all temporary files
-        for _, file_path in temp_files:
-            try:
+                # Close any open file handles
                 os.unlink(file_path)
             except:
                 pass
@@ -522,17 +542,17 @@ def main():
         
         # Step 3: Authenticate with FireMon
         print(f"Authenticating with FireMon at {firemon_host}...")
-        firemon_token = authenticate_firemon(firemon_host, firemon_username, firemon_password)
+        firemon_session = authenticate_firemon(firemon_host, firemon_username, firemon_password)
         print(f"Successfully authenticated with FireMon at {firemon_host}")
         
         # Step 4: Get latest revision ID
         print(f"Getting latest revision ID for device {device_id}...")
-        revision_id = get_latest_revision(firemon_host, firemon_token, domain_id, device_id)
+        revision_id = get_latest_revision(firemon_host, firemon_session, domain_id, device_id)
         print(f"Latest revision ID for device {device_id} is {revision_id}")
         
         # Step 5: Post files to FireMon
         print(f"Posting configuration files to FireMon...")
-        result = post_files_to_firemon(firemon_host, firemon_token, revision_id, aci_data)
+        result = post_files_to_firemon(firemon_host, firemon_session, revision_id, aci_data)
         print(f"Successfully posted {result['success']} configuration files to FireMon")
         
         return 0
